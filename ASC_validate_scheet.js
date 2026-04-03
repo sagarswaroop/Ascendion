@@ -3,7 +3,7 @@
  *@NScriptType MapReduceScript
  *@author Sagar Kumar
  */
-define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file, runtime, search, query) => {
+define(['N/record', 'N/file', "N/runtime", "N/search", "N/query", "N/https"], (record, file, runtime, search, query, https) => {
 
     const projectType = {
         "Subtier resource": 2,
@@ -14,12 +14,12 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
     // Biweekly cycle 2, Friday-ending Weekly, Special Invoicing terms, monthly
     const billingcycleList = {
         "Monthly": 2,
-        "Friday-ending Weekly": 26,
-        "Weekly": 3,
-        "Biweekly": 42,
-        "Sunday-ending Weekly": 160,
-        "Biweekly cycle 1": 18,
-        "Biweekly cycle 2": 19,
+        "Friday-ending Weekly": 26, // bill will generate on friday.
+        "Weekly": 3, // bill will generate on saturday  .
+        "Biweekly": 42, // bill will generate on 2nd saturday.
+        "Sunday-ending Weekly": 160, // bill will generate on sunday.
+        "Biweekly cycle 1": 18, // bill will generate on 2nd saturday.
+        "Biweekly cycle 2": 19, // bill will generate on 2nd saturday.
     }
 
     function getInputData() {
@@ -44,6 +44,7 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
                 // Update the total based on the line value
                 let lineValues = line.value.split(',');
                 // log.debug({ title: "lineValues", details: lineValues });
+                // validateDataList.push({ "empId": lineValues[0], "empId": lineValues[1], "startDate": lineValues[2], "endDate": lineValues[3] });
                 validateDataList.push({ "empId": lineValues[0], "startDate": lineValues[1], "endDate": lineValues[2] });
 
                 return true;
@@ -62,7 +63,7 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
             let approvedTSresult = [];
             // log.debug({ title: "Map Context", details: rowData });
 
-            approvedTSresult = checkApprovedTimeBill(rowData.empId, rowData.startDate, rowData.endDate);
+            approvedTSresult = checkApprovedTimeBill(rowData.empId, rowData.startDate, rowData.endDate, "");
 
             if (approvedTSresult.length > 0) {
 
@@ -76,7 +77,7 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
                 // });
 
             } else {
-                approvedTSresult = checkSubmitTimeBill(rowData.empId, rowData.startDate, rowData.endDate);
+                approvedTSresult = checkSubmitTimeBill(rowData.empId, rowData.startDate, rowData.endDate, "");
 
                 if (approvedTSresult.length > 0) {
 
@@ -101,162 +102,335 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
 
             // log.debug("Map Stage: approvedTSresult", approvedTSresult);
 
-            context.write({ key: rowData.empId + "_" + rowData.startDate + "_" + rowData.endDate, value: { originalData: rowData, result: approvedTSresult } });
+            context.write({ key: rowData.empId + "_" + rowData.startDate + "_" + rowData.endDate, value: JSON.stringify({ originalData: rowData, result: approvedTSresult }) });
         } catch (error) {
             log.error("Map Stage: Error", error);
         }
 
     }
 
-
-
     function reduce(context) {
-        log.debug("Reduce Stage: context", context);
-        const errorList = [];
+        log.debug("Reduce Stage: key", context.key);
+
+        let errorList = [];
         try {
-            debugger;
-            const uniqueKey = context.key;
-            const data = JSON.parse(context.values);
-            log.debug("Reduce stage: fetch data", { key: uniqueKey, data: data });
-            const tsStatus = data.originalData.tsApprovalStatus;
-            log.debug("tsStatus", tsStatus);
-            if (!tsStatus) {
-                errorList.push(`*TS is not available - ${uniqueKey}.`);
-                log.debug("validateData", "TS is not available.");
-            } else {
+            context.values.forEach(function (val) {
+                log.debug("Reduce Stage: val", val);
+                let isNoError = true;
+
+                const data = JSON.parse(val);
+                const tsStatus = data.originalData.tsApprovalStatus;
+
+                if (!tsStatus) {
+                    // let gciId = data.originalData.empId;
+                    // EhrisId = gciId.replace(/\D/g, '');
+                    // let wsd = data.originalData.startDate;
+                    // let wed = data.originalData.endDate;
+                    // let dataObj = { "gciId": EhrisId, "wsd": formatDate(new Date(wsd)), "wed": formatDate(new Date(wed)) };
+                    // let res = importTimesheet(dataObj);
+
+                    errorList.push(`*TS is not available - ${data.originalData.empId}`);
+                    isNoError = false;
+                    return;
+                }
+
+                if (data.result.length > 1) {
+                    errorList.push(`** Allocated to multiple projects - ${context.key}.`);
+                    isNoError = false;
+                }
+
+                log.debug("redcue: checked multiple projects");
+
+                const resourceWiseErrorObj = {}
                 data.result.forEach(lineData => {
-                    // log.debug("validateData", lineData);
+                    let resultlineError = [];
+                    try {
+                        // log.debug("validateData", lineData);
 
-                    // fetch project and resource allocation details.
-                    const resourceDetails = getProjectDetails(lineData.project, data.originalData.empId);
-                    // log.debug("Reduce: resourceDetails", resourceDetails);
-                    // get total dates as per 7 days.
-
-                    let updatedData = getDateBasedBillingCycle(resourceDetails, lineData.startDate, lineData.endDate, lineData.project, data.originalData.empId);
-                    log.debug("Reduce: updatedData", updatedData);
-
-                    if (updatedData.length == 0) {
-                        updatedData = lineData;
-                    }else{
-                        updatedData = updatedData[0];
-                    }
-
-                    //check vendor bill is available and log if found.
-                    let billList = updatedData.vdrBill.filter(id => id !== "");
-                    billList.forEach(billId => {
-                        const billDetails = getBillDetails(billId);
-                        errorList.push(`${billDetails.tranid} bill available - ${billDetails.billstartdate} : ${billDetails.billenddate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                    });
-
-                    // check other details if no bill found.
-                    if (billList.length == 0) {
-
-                        //check customer invoice is available and log if found.
-                        let invList = updatedData.invoice.filter(id => id !== "");
-                        invList.forEach(billId => {
-                            // const billDetails = getBillDetails(billId);
-                            errorList.push(`Customer Invoice available - period ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                        });
+                        // fetch project and resource allocation details.
+                        let resourceDetails = getProjectDetails(lineData.project, data.originalData.empId);
+                        log.debug("Reduce: resourceDetails", resourceDetails);
+                        // get total dates as per 7 days.
 
                         // check resource allocation.
-                        if (resourceDetails.length == 0) {
-                            errorList.push(`* No resource allocation found - period ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
+                        if (resourceDetails.length == 0 && data.result.length > 1) {
+                            return;
+                        } else if (resourceDetails.length == 0) {
+                            errorList.push(`* No resource allocation available - period ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId}`);
+                            isNoError = false;
+                            return;
                         } else {
-                            if (resourceDetails.projecttype == "") {
-                                errorList.push(`* ${resourceDetails.entityid} Project type is missing - ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} - ${resourceDetails.taskid} (task id)`);
-                                log.debug("validateData", `*Project type is missing- ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                            }
-
-                            if (resourceDetails.resourcestart > updatedData.endDate) {
-                                errorList.push(`** Resource allocation start after time sheet period - ${resourceDetails.resourcestart} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                            }
-
-                            debugger;
-                            log.debug("validateData", `Resource Allocation End Date: ${resourceDetails.resourceend} | TS Start Date: ${updatedData.startDate}`);
-                            if (new Date(resourceDetails.resourceend) < new Date(updatedData.startDate)) {
-                                errorList.push(`** Resource allocation end before time sheet period - ${resourceDetails.resourceend} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                            }
-                        }
-
-
-                        // check pay rate.
-                        const payRateRecord = getPayRate(data.originalData.empId, lineData.project);
-
-                        if (payRateRecord.length == 0) {
-                            errorList.push(`* No pay Rate available - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                        } else {
-                            if (payRateRecord.length > 1) {
-                                payRateRecord.forEach(PayRateData => {
-                                    if (PayRateData.taskType == "1" && PayRateData.rate > 0) { //ST
-                                        if (PayRateData.date <= updatedData.startDate) {
-                                            errorList.push(`${PayRateData.rate} ST pay rate is available - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
-                                        } else if (PayRateData.date <= updatedData.endDate && PayRateData.date > updatedData.startDate) {
-                                            errorList.push(`*** ${PayRateData.rate} ST Pay rate is available from - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
-                                        } else if (data.date >= updatedData.endDate) {
-                                            errorList.push(`** ${PayRateData.rate} ST Pay rate is available after - ${data.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
-                                        }
-                                    } else if (PayRateData.taskType == "2" && PayRateData.rate > 0) { //OT
-                                        if (PayRateData.date <= updatedData.startDate) {
-                                            errorList.push(`${PayRateData.rate} OT pay rate is available - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
-                                        } else if (PayRateData.date <= updatedData.endDate && PayRateData.date > updatedData.startDate) {
-                                            errorList.push(`*** ${PayRateData.rate} OT Pay rate is available from - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
-                                        } else if (PayRateData.date >= updatedData.endDate) {
-                                            errorList.push(`** ${PayRateData.rate} OT Pay rate is available after - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
-                                        }
-                                    } else {
-                                        errorList.push(`* No pay Rate available : ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                                    }
-                                });
-                            }else{
-                                const PayRateData = payRateRecord[0];
-                                 if (PayRateData.taskType == "1" && PayRateData.rate > 0){
-                                    errorList.push(`* OT Rate not available : ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                                 }else{
-                                    errorList.push(`* ST Rate not available : ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                                 }
-                            }
-                        }
-
-                        // check vendor details.
-                        const VendorDetails = getVendorDetail(data.originalData.empId, lineData.project, updatedData.startDate);
-
-                        if (VendorDetails.length > 0) {
-                            VendorDetails.forEach(detail => {
-                                if (detail.startdate <= updatedData.startDate) {
-                                    errorList.push(`Vendor Detail available and correct - ${detail.startdate} date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                                } else if (detail.startdate > updatedData.endDate) {
-                                    errorList.push(`** Vendor Detail available after date - ${detail.startdate} date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
+                            // it check resource allocation for given period.
+                            let isValidResource = false;
+                            resourceDetails.forEach(resAllocation => {
+                                if (new Date(resAllocation.resourceend) > new Date(lineData.endDate)) {
+                                    isValidResource = true;
+                                    resourceDetails = resAllocation;
                                 }
                             });
-                        } else {
-                            errorList.push(`* Vendor Detail not available - employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                        }
 
-                        // check time track.
-                        if (updatedData.tsDateList.length == 0) {
-                            errorList.push(`* Time sheet is missing- ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                            log.debug("validateData", `Time sheet is missing- ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                        } else if (updatedData.tsStatus == 'submit') {
-                            errorList.push(`** Time sheet available with submit - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                            log.debug("validateData", `Time sheet available with submit - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
-                        } else if (updatedData.tsStatus == 'approved') {
-                            if (updatedData.tsDateList.length > 0 && updatedData.tsDateList.length != 7) {
-                                errorList.push(`** Time sheet incomplete with ${updatedData.tsStatus} - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id) TS Dates: ${updatedData.tsDateList.join(", ")}`);
-                            } else {
-                                errorList.push(`Time sheet available with approved - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} (task id)`);
+                            if (!isValidResource && resourceDetails.length > 0) {
+                                resourceDetails = resourceDetails[0];
                             }
                         }
 
+                        resourceWiseErrorObj.project = resourceDetails.entityid;
+                        resourceWiseErrorObj.task = resourceDetails.taskid;
+
+
+                        let updatedData = getDateBasedBillingCycle(resourceDetails, lineData.startDate, lineData.endDate, lineData.project, data.originalData.empId);
+                        // log.debug("Reduce: updatedData", updatedData);
+
+                        if (updatedData.length == 0) {
+                            updatedData = lineData;
+                            // log.debug("Reduce: updatedData: updatedData = lineData;", updatedData);
+                        } else {
+                            updatedData = updatedData[0];
+                            // log.debug("Reduce: updatedData : updatedData = updatedData[0]", updatedData);
+                        }
+
+                        //check vendor bill is available and log if found.
+                        let billList = updatedData.vdrBill.filter(id => id !== "") || [];
+
+                        log.debug("redcue: checking Vendor bill");
+                        if (billList.length > 0) {
+                            //empty the error list if bill available as don't need any other validation.
+                            errorList = [];
+                            billList.forEach(billId => {
+                                log.debug("billId", billId);
+                                let billList = getBillDetails(billId, "", "", "", "");
+                                billList.forEach(billDetails => {
+                                    errorList.push(`${billDetails.tranid} bill available - ${billDetails.billstartdate} : ${billDetails.billenddate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`)
+                                });
+                            });
+                        } else {
+                            // log.debug("no bill id");
+                            billList = getBillDetails("", updatedData.startDate, updatedData.endDate, lineData.project, data.originalData.empId);
+
+                            if (billList.length > 0) {
+                                errorList = [];
+                                billList.forEach(billDetails => {
+                                    errorList.push(`${billDetails.tranid} bill available - ${billDetails.billstartdate} : ${billDetails.billenddate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`)
+                                });
+                            }
+                        }
+
+                        log.debug("redcue: checked Vendor bill");
+
+                        if (billList.length > 0) {
+                            context.write({ key: context.key, value: errorList });
+                            return;
+                        }
+
+                        // check resource allocation.
+                        log.debug("redcue: checking resource allocation");
+                        if (!resourceDetails) {
+                            errorList.push(`* No resource allocation found - period ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                            isNoError = false;
+                        } else {
+                            if (resourceDetails.projecttype == "") {
+                                errorList.push(` ${resourceDetails.entityid} Project type is missing - ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} - ${resourceDetails.taskid}`);
+                                log.debug("validateData", `Project type is missing- ${lineData.startDate} : ${lineData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+
+                            if (new Date(resourceDetails.resourcestart).getTime() > new Date(updatedData.endDate).getTime()) {
+                                errorList.push(` No allocation for this period and started from- ${resourceDetails.resourcestart} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+
+                            // log.debug("validateData", `Resource Allocation End Date: ${resourceDetails.resourceend} | TS Start Date: ${updatedData.startDate}`);
+                            if (new Date(resourceDetails.resourceend).getTime() < new Date(updatedData.startDate).getTime()) {
+                                errorList.push(`No allocation for this period and ended on - ${resourceDetails.resourceend} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+
+                            // check resource end date is before resource start date.
+                            if (new Date(resourceDetails.resourceend).getTime() < new Date(resourceDetails.resourcestart).getTime()) {
+                                errorList.push(`* Resource allocation is wrong - ${resourceDetails.resourcestart} : ${resourceDetails.resourceend} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+
+                            if (new Date(resourceDetails.projectenddate).getTime() < new Date(resourceDetails.resourceend).getTime()) {
+                                errorList.push(`Project (${resourceDetails.projectenddate}) End before resource end - ${resourceDetails.resourcestart} : ${resourceDetails.resourceend} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+                        }
+
+                        log.debug("redcue: checked resource allocation");
+                        // check other details if no bill found.
+
+                        log.debug("redcue: checking other details", `resourceDetails.resourceDetails ${resourceDetails.toString()}, billList.length ${billList.length}`);
+                        if (resourceDetails && billList.length == 0) {
+
+                            //check customer invoice is available and log if found except Fix bid.
+                            if (resourceDetails.projecttype != projectType["Fixed Prices Projects"]) {
+                                let invList = updatedData.invoice.filter(id => id !== "");
+
+                                if (invList.length == 0) {
+                                    let openInvoices = checkOpenInvoices(updatedData.startDate, updatedData.endDate, lineData.project, data.originalData.empId);
+                                    if (openInvoices.length > 0) {
+                                        openInvoices.forEach(invId => {
+                                            errorList.push(`${invId.tranid} (id) Customer Invoice available - period ${invId.custbody_clb_periodstartingdate} : ${invId.custbody_clb_periodendingdate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                            // isNoError = false;
+                                        });
+                                    } else {
+                                        errorList.push(`No Invoice avaiable - period ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                        isNoError = false;
+                                    }
+                                } else {
+                                    invList.forEach(invId => {
+                                        // const billDetails = getBillDetails(billId);
+                                        let invoice = getInvData(invId);
+                                        if (invoice.length > 0) {
+                                            invoice = invoice[0];
+                                            errorList.push(`${invoice.tranid} (id) Customer Invoice available - period ${invoice.invstartdate} : ${invoice.invenddate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                            // isNoError = false;
+                                        }
+                                    });
+                                }
+                            }
+
+                            log.debug("redcue: checked customer invoice");
+
+                            // check project end before resource allocation end date.
+                            if (new Date(resourceDetails.projectenddate).getTime() < new Date(updatedData.startDate).getTime()) {
+                                errorList.push(`* Project end before resource allocation end - ${resourceDetails.projectenddate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+
+                            log.debug("redcue: checked project end");
+
+                            // check pay rate.
+                            const payRateRecord = getPayRate(data.originalData.empId, lineData.project);
+
+                            if (payRateRecord.length == 0) {
+                                errorList.push(`* No pay Rate available - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            } else {
+                                if (payRateRecord.length > 1) {
+                                    payRateRecord.forEach(PayRateData => {
+                                        if (PayRateData.taskType == "1" && PayRateData.rate > 0) { //ST
+                                            if (new Date(PayRateData.date) <= new Date(updatedData.startDate)) {
+                                                // all good nothing to log.
+                                                // errorList.push(`${PayRateData.rate} ST pay rate is available - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
+                                            } else if (new Date(PayRateData.date) <= new Date(updatedData.endDate) && new Date(PayRateData.date) > new Date(updatedData.startDate)) {
+                                                errorList.push(` ${PayRateData.rate} ST Pay rate is available from mid date - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
+                                                isNoError = false;
+                                            } else if (new Date(data.date) >= new Date(updatedData.endDate)) {
+                                                errorList.push(` ${PayRateData.rate} ST Pay rate is available after - ${data.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
+                                                isNoError = false;
+                                            }
+                                        } else if (PayRateData.taskType == "2" && PayRateData.rate > 0) { //OT
+                                            if (new Date(PayRateData.date) <= new Date(updatedData.startDate)) {
+                                                // all good nothing to log.
+                                                // errorList.push(`${PayRateData.rate} OT pay rate is available - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
+                                            } else if (new Date(PayRateData.date) <= new Date(updatedData.endDate) && new Date(PayRateData.date) > new Date(updatedData.startDate)) {
+                                                errorList.push(` ${PayRateData.rate} OT Pay rate is available from mid date - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
+                                                isNoError = false;
+                                            } else if (new Date(PayRateData.date) >= new Date(updatedData.endDate)) {
+                                                errorList.push(` ${PayRateData.rate} OT Pay rate is available after - ${PayRateData.date} effective date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${PayRateData.wkfTaskId}`);
+                                                isNoError = false;
+                                            }
+                                        } else {
+                                            errorList.push(`* No pay Rate available : ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                            isNoError = false;
+                                        }
+                                    });
+                                } else {
+                                    const PayRateData = payRateRecord[0];
+                                    if (PayRateData.taskType == "1" && PayRateData.rate > 0) {
+                                        errorList.push(`OT Rate not available : ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                        isNoError = false;
+                                    } else {
+                                        errorList.push(`ST Rate not available : ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                        isNoError = false;
+                                    }
+                                }
+                            }
+
+                            log.debug("redcue: checked pay rate");
+
+                            // check vendor details.
+                            const VendorDetails = getVendorDetail(data.originalData.empId, lineData.project, updatedData.startDate);
+
+                            if (VendorDetails.length > 0) {
+                                VendorDetails.forEach(detail => {
+                                    // vendor details started before timesheet start date.
+                                    if (new Date(detail.startdate).getTime() <= new Date(updatedData.startDate).getTime()) {
+                                        // errorList.push(`Vendor Detail available and correct - ${detail.startdate} date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                        if (detail.missindatefield == "" || detail.missindatefield == null) {
+                                            errorList.push(`* Vendor Detail not available - employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                            isNoError = false;
+                                        }
+                                    } else if (new Date(detail.startdate).getTime() > new Date(updatedData.endDate).getTime()) {
+                                        // vendor details started after timesheet end date.
+                                        errorList.push(` Vendor Detail available after date - ${detail.startdate} date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                    }
+                                    // vendor details ended before timesheet start date.
+                                    else if (new Date(detail.enddate).getTime() < new Date(updatedData.startDate).getTime()) {
+                                        errorList.push(` Vendor Detail available before date - ${detail.startdate} date for employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                    }
+                                });
+                            } else {
+                                errorList.push(`* Vendor Detail not available - employee ${data.originalData.empId} with Project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            }
+
+                            log.debug("redcue: checked vendor details");
+
+                            // check time track.
+                            if (updatedData.tsDateList.length == 0) {
+                                errorList.push(`* TS is not available- ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                log.debug("validateData", `* TS is not available- ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            } else if (updatedData.tsStatus == 'submit') {
+                                errorList.push(` Time sheet available with submit - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                log.debug("validateData", `Time sheet available with submit - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                isNoError = false;
+                            } else if (updatedData.tsStatus == 'approved') {
+                                if (updatedData.tsDateList.length > 0 && (updatedData.tsDateList.length != 7 || updatedData.tsDateList.length != 30)) {
+                                    errorList.push(`Time sheet incomplete with ${updatedData.tsStatus} - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid} with total TS days: ${updatedData.tsDateList.length}`);
+                                    isNoError = false;
+                                }
+                                //  else {
+                                //     errorList.push(`Time sheet available with approved - ${updatedData.startDate} : ${updatedData.endDate} for employee ${data.originalData.empId} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                                // }
+                            }
+                        }
+
+                        log.debug("redcue: checked time track");
+
+                        if (isNoError) {
+                            errorList.push(`* No error found for employee ${data.originalData.empId} for period ${updatedData.startDate} : ${updatedData.endDate} with project ${resourceDetails.entityid} - ${resourceDetails.taskid}`);
+                            return;
+                        }
+                    } catch (error) {
+                        log.error({
+                            title: "Reduce: Validate Data Error",
+                            details: error
+                        });
+
                     }
-
                 });
-            }
 
-            log.debug("Reduce stage: errorList", errorList);
+                if (isNoError) {
+                    errorList.push(`* No error found for employee ${data.originalData.empId}`);
+                }
+            });
 
-            context.write({ key: uniqueKey, value: errorList });
+            errorList = getUnique(errorList);
+
+            context.write({
+                key: context.key,
+                value: errorList
+            });
+
         } catch (error) {
-            log.error("Reduce Stage: Error", error);
+            log.error({
+                title: "Reduce Stage JSON Error",
+                details: error
+            });
         }
     }
 
@@ -266,7 +440,7 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
             const fileId = scriptObj.getParameter({ name: "custscript_csv_fileid" });
             const inputFile = file.load({ id: fileId });
             const folderId = inputFile.folder;
-            log.debug("Summarize Stage: File Folder", folderId);
+            // log.debug("Summarize Stage: File Folder", folderId);
 
             const errorMap = {};
 
@@ -274,7 +448,8 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
             summary.output.iterator().each(function (key, value) {
                 try {
                     // log.debug("summarize key value", { key: key, value: value });
-                    const errorList = JSON.parse(value);
+                    let errorList = JSON.parse(value);
+                    errorList = [...new Set(errorList)];
                     errorMap[key] = errorList.join(" | ");
                 } catch (err) {
                     log.error("summarize parse error", err);
@@ -329,6 +504,19 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
         }
     }
 
+    function getUnique(arr) {
+        var map = {};
+        var output = [];
+        for (var i = 0; i < arr.length; i++) {
+            var item = arr[i];
+            if (!map[item]) {
+                map[item] = true;
+                output.push(item);
+            }
+        }
+        return output;
+    }
+
     function formateDate(date) {
         let sysdate = new Date(date);
         return ('0' + (sysdate.getMonth() + 1)).slice(-2) + '/'
@@ -336,26 +524,30 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
             + sysdate.getFullYear();
     }
 
-    function checkSubmitTimeBill(empId, startDate, endDate) {
+    function checkSubmitTimeBill(empId, startDate, endDate, projectId) {
         const submittedTimeBillList = [];
+        const myfilters = [
+            ["custcol_asc_timesheet_status", "anyof", "2"],
+            "AND",
+            ["employee", "anyof", empId],
+            "AND",
+            ["date", "within", startDate, endDate],
+            "AND",
+            ["duration", "greaterthanorequalto", "0"],
+            "AND",
+            ["type", "anyof", "A"],
+            // "AND",
+            // ["custcol_clb_weekendingdate", "on", rowData.endDate]
+        ];
+        if (projectId) {
+            myfilters.push("AND");
+            myfilters.push(["customer", "anyof", projectId]);
+        }
         try {
             let isApprovedTimeBill = true;
             var timeBillSubmittedStatusObj = search.create({
                 type: "timebill",
-                filters:
-                    [
-                        // ["approvalstatus", "anyof", "3"],
-                        // "AND",
-                        ["employee", "anyof", empId],
-                        "AND",
-                        ["date", "within", startDate, endDate],
-                        "AND",
-                        ["duration", "greaterthanorequalto", "0"],
-                        "AND",
-                        ["type", "anyof", "A"],
-                        // "AND",
-                        // ["custcol_clb_weekendingdate", "on", rowData.endDate]
-                    ],
+                filters: myfilters,
                 columns:
                     [
                         search.createColumn({ name: "date", label: "Date" }),
@@ -435,27 +627,31 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
         }
     }
 
-    function checkApprovedTimeBill(empId, startDate, endDate) {
+    function checkApprovedTimeBill(empId, startDate, endDate, projectId) {
 
-        // log.debug("checkApprovedTimeBill data:", { empId: empId, startDate: startDate, endDate: endDate });
+        log.debug("checkApprovedTimeBill data:", { empId: empId, startDate: startDate, endDate: endDate });
         const approvedTimeBillList = [];
+        const myfilters = [
+            ["custcol_asc_timesheet_status", "anyof", "2"],
+            "AND",
+            ["employee", "anyof", empId],
+            "AND",
+            ["date", "within", startDate, endDate],
+            "AND",
+            ["duration", "greaterthanorequalto", "0"],
+            "AND",
+            ["type", "anyof", "A"],
+            // "AND",
+            // ["custcol_clb_weekendingdate", "on", rowData.endDate]
+        ];
+        if (projectId) {
+            myfilters.push("AND");
+            myfilters.push(["customer", "anyof", projectId]);
+        }
         try {
             var timeBillApprovalStatusObj = search.create({
                 type: "timebill",
-                filters:
-                    [
-                        ["custcol_asc_timesheet_status", "anyof", "2"],
-                        "AND",
-                        ["employee", "anyof", empId],
-                        "AND",
-                        ["date", "within", startDate, endDate],
-                        "AND",
-                        ["duration", "greaterthanorequalto", "0"],
-                        "AND",
-                        ["type", "anyof", "A"],
-                        // "AND",
-                        // ["custcol_clb_weekendingdate", "on", rowData.endDate]
-                    ],
+                filters: myfilters,
                 columns:
                     [
                         search.createColumn({ name: "date", label: "Date" }),
@@ -477,7 +673,7 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
                     ]
             });
             const timeBillApprovalStatusCount = timeBillApprovalStatusObj.runPaged().count;
-            log.debug("timeBillApprovalStatusObj result count", timeBillApprovalStatusCount);
+            // log.debug("timeBillApprovalStatusObj result count", timeBillApprovalStatusCount);
             timeBillApprovalStatusObj.run().each(function (result) {
                 // .run().each has a limit of 4,000 results
                 const tsDate = result.getValue({ name: "date", label: "Date" });
@@ -538,6 +734,7 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
                 return true;
             });
 
+            // log.debug("checkApprovedTimeBill: approvedTimeBillList", approvedTimeBillList);
             return approvedTimeBillList;
         } catch (error) {
             log.error("checkApprovedTimeBill: error", error);
@@ -546,10 +743,30 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
 
     function getProjectDetails(projectId, empId) {
         try {
-            const sqlString = `select job.entityid, job.custentity_clb_lastday as WeekEnding, job.custentity_clb_projecttypeforinvoicing as projecttype, job.custentity_clb_bilcycle as projctbillingcycle, job.startdate as projectstartdate, job.custentity_clb_projct_end_dte as projectenddate, resourceAllocation.custevent_clb_prjct_workl_tsk_id as taskid, resourceAllocation.startdate as resourceStart, resourceAllocation.enddate as resourceend from job full join resourceAllocation on (resourceAllocation.project = job.id) where job.id = ${projectId} AND resourceAllocation.allocationresource = ${empId}`;
+            const sqlString = `SELECT 
+                                job.entityid,
+                                job.custentity_clb_lastday AS WeekEnding,
+                                job.custentity_clb_projecttypeforinvoicing AS projecttype,
+                                job.custentity_clb_bilcycle AS projctbillingcycle,
+                                job.startdate AS projectstartdate,
+                                job.custentity_clb_projct_end_dte AS projectenddate,
+                                resourceAllocation.custevent_clb_prjct_workl_tsk_id AS taskid,
+                                resourceAllocation.startdate AS resourceStart,
+                                resourceAllocation.enddate AS resourceend
+                            FROM 
+                                job 
+                                FULL JOIN resourceAllocation 
+                                    ON resourceAllocation.project = job.id
+                            WHERE 
+                                job.id = ${projectId}
+                                AND resourceAllocation.allocationresource = ${empId}
+                                AND resourceAllocation.startdate <> resourceAllocation.enddate
+                            ORDER BY 
+                                resourceAllocation.enddate DESC;
+                            `;
             let projectDetails = query.runSuiteQL({ query: sqlString }).asMappedResults();
 
-            projectDetails = projectDetails.length > 0 ? projectDetails[0] : [];
+            projectDetails = projectDetails.length > 0 ? projectDetails : [];
 
             return projectDetails;
         } catch (error) {
@@ -558,18 +775,43 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
         }
     }
 
-    function getBillDetails(billId) {
+    function getBillDetails(billId, startDate, endDate, projectId, empId) {
         try {
-            const sqlString = `SELECT vendorBill.tranid ,vendorBill.custbody_clb_startdate as billStartDate, vendorBill.custbody_clb_enddate as billEndDate FROM transaction as vendorBill Where type = 'VendBill' AND vendorBill.id = ${billId}`;
+            let sqlString = '';
+            if (projectId == "" && billId) {
+                sqlString = `SELECT vendorBill.tranid ,vendorBill.custbody_clb_startdate as billStartDate, vendorBill.custbody_clb_enddate as billEndDate FROM transaction as vendorBill Where type = 'VendBill' AND vendorBill.id = ${billId} AND vendorBill.custbody_asc_transaction_reversed = 'F'`;
+            } else {
+                // sqlString = `SELECT vendorBill.tranid ,vendorBill.custbody_clb_startdate as billstartdate, vendorBill.custbody_clb_enddate as billenddate FROM transaction as vendorBill Where type = 'VendBill' AND vendorBill.custbody_clb_startdate >= '${startDate}' AND vendorBill.custbody_asc_inv_project_selected = '${projectId}' AND vendorBill.custbody_asc_subcon_employee = '${empId}'`;
+                sqlString = `SELECT vendorBill.tranid ,vendorBill.custbody_clb_startdate as billstartdate, vendorBill.custbody_clb_enddate as billenddate FROM transaction as vendorBill Where type = 'VendBill' AND vendorBill.custbody_clb_startdate >= '${startDate}' AND vendorBill.custbody_clb_startdate <= '${endDate}' AND vendorBill.custbody_asc_inv_project_selected = '${projectId}' AND vendorBill.custbody_asc_subcon_employee = '${empId}' AND vendorBill.custbody_asc_transaction_reversed = 'F'`;
+            }
+
+            // log.debug("getBillDetails: sqlString", sqlString);
+
             let billDetails = query.runSuiteQL({ query: sqlString }).asMappedResults();
 
-            billDetails = billDetails.length > 0 ? billDetails[0] : [];
+            billDetails = billDetails.length > 0 ? billDetails : [];
+
+            // if (billDetails.length == 0) {
+            //     sqlString = `SELECT vendorBill.tranid ,vendorBill.custbody_clb_startdate as billstartdate, vendorBill.custbody_clb_enddate as billenddate FROM transaction as vendorBill Where type = 'VendBill' AND vendorBill.custbody_clb_enddate <= '${endDate}' AND vendorBill.custbody_asc_inv_project_selected = '${projectId}' AND vendorBill.custbody_asc_subcon_employee = '${empId}'`;
+            //     billDetails = query.runSuiteQL({ query: sqlString }).asMappedResults();
+            //     billDetails = billDetails.length > 0 ? billDetails : [];
+            // }
 
             return billDetails;
         } catch (error) {
             log.error('getBillDetails: error', error);
-            return {};
+            return [];
         }
+    }
+
+    function getInvData(invId) {
+        let sqlString = `SELECT invoice.tranid ,invoice.custbody_clb_periodstartingdate as invstartdate, invoice.custbody_clb_periodendingdate as invenddate FROM transaction as invoice Where type = 'CustInvc' AND invoice.id = ${invId}`;
+
+        let invoice = query.runSuiteQL({ query: sqlString }).asMappedResults();
+
+        invoice = invoice.length > 0 ? invoice : [];
+
+        return invoice;
     }
 
     function getPayRate(empId, projectId) {
@@ -674,35 +916,61 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
 
     function getDateBasedBillingCycle(resouceDetails, startDate, endDate, projectId, employeeId) {
         try {
+            // log.debug("resouceDetails", resouceDetails);
             const billingCycle = resouceDetails.projctbillingcycle;
+            let billingCycleDetails = [];
             let periodStartDate = formateDate(startDate);
             let periodEndDate = formateDate(endDate);
 
             if (resouceDetails.projecttype == projectType["Fixed Prices Projects"]) {
+                // log.debug("getDateBasedBillingCycle: Fixed Prices Projects");
                 periodStartDate = getWeekdayDate(startDate, endDate, "monday");
                 periodEndDate = getWeekStartDate(periodStartDate, 6);
             } else {
-                if (billingCycle == billingcycleList.Biweekly || billingCycle == billingcycleList["Biweekly cycle 1"] || billingCycle == billingcycleList["Biweekly cycle 2"]) {
-                    periodStartDate = getWeekdayDate(startDate, endDate, "sunday");
-                    periodEndDate = getWeekStartDate(periodStartDate, 13);
-                } else if (billingCycle == billingcycleList["Friday-ending Weekly"]) {
-                    periodStartDate = getWeekdayDate(startDate, endDate, "sturday");
-                    periodEndDate = getWeekStartDate(periodStartDate, 6);
-                } else if (billingCycle == billingcycleList.Monthly) {
-                    // First day of month
-                    periodStartDate = new Date(date.getFullYear(), date.getMonth(), 1);
-                    // Last day of month
-                    periodEndDate = new Date(date.getFullYear(), date.getMonth() + 1, 0);
+                log.debug("getDateBasedBillingCycle: else");
+                let queryStr = `SELECT custrecord_bln_strt_dte AS billingstartdate, custrecord_blng_end_dte AS billingenddate FROM customrecord_clb_clientspecificbillingcy WHERE custrecord_blng_cyle = ${resouceDetails.projctbillingcycle} AND custrecord_blng_end_dte >= '${startDate}' ORDER BY custrecord_bln_strt_dte ASC`;
 
-                } else if (billingCycle == billingcycleList["Sunday-ending Weekly"]) {
-                    periodStartDate = getWeekdayDate(startDate, endDate, "monday");
-                    periodEndDate = getWeekStartDate(periodStartDate, 6);
-                } else if (billingCycle == billingcycleList.Weekly) {
-                    periodStartDate = getWeekdayDate(startDate, endDate, "sunday");
-                    periodEndDate = getWeekStartDate(periodStartDate, 6);
+                log.debug("getDateBasedBillingCycle: queryStr", queryStr);
+                billingCycleDetails = query.runSuiteQL({ query: queryStr }).asMappedResults();
+
+                billingCycleDetails = billingCycleDetails.length > 0 ? billingCycleDetails[0] : [];
+
+                if (billingCycleDetails) {
+                    log.debug("getDateBasedBillingCycle: billingCycleDetails", billingCycleDetails);
+                    periodStartDate = billingCycleDetails.billingstartdate;
+                    periodEndDate = billingCycleDetails.billingenddate;
                 } else {
-                    periodStartDate = startDate;
-                    periodEndDate = endDate;
+                    log.debug("getDateBasedBillingCycle - billingCycleDetails: else");
+                    if (billingCycle == billingcycleList.Biweekly || billingCycle == billingcycleList["Biweekly cycle 1"] || billingCycle == billingcycleList["Biweekly cycle 2"]) {
+                        log.debug("getDateBasedBillingCycle - billingCycleDetails: Biweekly");
+                        periodStartDate = getWeekdayDate(startDate, endDate, "sunday");
+                        periodEndDate = getWeekStartDate(periodStartDate, 13);
+                    } else if (billingCycle == billingcycleList["Friday-ending Weekly"]) {
+                        log.debug("getDateBasedBillingCycle - billingCycleDetails: Friday-ending Weekly");
+                        periodStartDate = getWeekdayDate(startDate, endDate, "sturday");
+                        periodEndDate = getWeekStartDate(periodStartDate, 6);
+                    } else if (billingCycle == billingcycleList.Monthly) {
+                        log.debug("getDateBasedBillingCycle - billingCycleDetails: Monthly");
+                        // First day of month
+                        startDate = new Date(startDate);
+                        periodStartDate = new Date(startDate.getFullYear(), startDate.getMonth(), 1);
+                        // Last day of month
+                        endDate = new Date(endDate)
+                        periodEndDate = new Date(endDate.getFullYear(), endDate.getMonth() + 1, 0);
+
+                    } else if (billingCycle == billingcycleList["Sunday-ending Weekly"]) {
+                        log.debug("getDateBasedBillingCycle - billingCycleDetails: Sunday-ending Weekly");
+                        periodStartDate = getWeekdayDate(startDate, endDate, "monday");
+                        periodEndDate = getWeekStartDate(periodStartDate, 6);
+                    } else if (billingCycle == billingcycleList.Weekly) {
+                        log.debug("getDateBasedBillingCycle - billingCycleDetails: Weekly");
+                        periodStartDate = getWeekdayDate(startDate, endDate, "sunday");
+                        periodEndDate = getWeekStartDate(periodStartDate, 6);
+                    } else {
+                        log.debug("getDateBasedBillingCycle - billingCycleDetails: else");
+                        periodStartDate = startDate;
+                        periodEndDate = endDate;
+                    }
                 }
             }
 
@@ -711,14 +979,19 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
             startDate = formateDate(startDate);
             endDate = formateDate(endDate);
 
+            // log.debug("getDateBasedBillingCycle: periodStartDate", { "periodStartDate": periodStartDate, "periodEndDate": periodEndDate, "startDate": startDate, "endDate": endDate });
+
             let returnData = [];
-            if (periodStartDate != startDate && periodEndDate != endDate) {
-                returnData = checkApprovedTimeBill(employeeId, periodStartDate, periodEndDate);
+            if (new Date(periodStartDate).getTime() != new Date(startDate).getTime() && new Date(periodEndDate).getTime() != new Date(endDate).getTime()) {
+                // log.debug("getDateBasedBillingCycle: checkApprovedTimeBill");
+                returnData = checkApprovedTimeBill(employeeId, periodStartDate, periodEndDate, projectId);
             }
 
             if (returnData.length > 0) {
-                if (returnData[0].tsDateList.length == 0)
-                    returnData = checkSubmitTimeBill(employeeId, periodStartDate, periodEndDate);
+                if (returnData[0].tsDateList.length == 0) {
+                    log.debug("getDateBasedBillingCycle: checkSubmitTimeBill");
+                    returnData = checkSubmitTimeBill(employeeId, periodStartDate, periodEndDate, projectId);
+                }
             }
 
             return returnData
@@ -738,6 +1011,56 @@ define(['N/record', 'N/file', "N/runtime", "N/search", "N/query"], (record, file
         }
 
     }
+
+    // function addmisingDate(vdrDetailsRecId, startDate, endDate) {
+    //     record.submitFields({
+    //         type: "",
+    //         id: number | string*,
+    //         values: Object*,
+    //         options: {
+    //             enablesourcing: boolean,
+
+    //     })
+
+    // }
+
+    const importTimesheet = (dataObj) => {
+        try {
+            log.debug({ title: "dataObj", details: dataObj });
+            let apiUrl = "https://devnetsuiteapi.ascendion.com/PostConsultantTimesheet_Manual?GCIID=" + dataObj.gciId + "&DateFrom=" + dataObj.wsd + "&DateTo=" + dataObj.wed + "";
+            log.debug({ title: "apiUrl", details: apiUrl });
+            let headers = {
+                "Content-Type": "application/json",
+                "UserId": "NetsuiteResponse",
+                "Password": "Password@123",
+                "Cache-Control": "no-cache",
+                "Accept-Encoding": " gzip, deflate, br",
+                "Connection": "keep-alive"
+            };
+            let responseObj = "";
+            responseObj = https.post({ url: apiUrl, body: "", headers: headers });
+
+            return responseObj;
+        }
+        catch (ex) {
+            log.error({ title: "Import Timesheet", details: ex });
+        }
+    };
+
+    const checkOpenInvoices = (startDate, endDate, projectId, empId) => {
+        log.debug({ title: "checkOpenInvoices", details: { startDate: startDate, endDate: endDate, projectId: projectId, empId: empId } });
+        try {
+            const quryStr = `SELECT id, tranid, custbody_clb_periodstartingdate, custbody_clb_periodendingdate FROM transaction WHERE type = 'CustInvc' AND job = ${projectId} AND custbody_clb_periodendingdate >='${startDate}' AND custbody_clb_periodendingdate <= '${endDate}' AND custbody_asc_transaction_reversed = 'F' AND custbody_clb_periodstartingdate IS NOT NULL AND custbody_clb_periodendingdate IS NOT NULL`;
+            log.debug({ title: "quryStr", details: quryStr });
+            return query.runSuiteQL({ query: quryStr }).asMappedResults();
+        } catch (error) {
+            log.error({ title: "checkOpenInvoices Error", details: error });
+            return [];
+        }
+    }
+
+
+    const formatDate = (date) => { return date.getFullYear() + "-" + (date.getMonth() + 1) + "-" + date.getDate() };
 
     return {
         getInputData: getInputData,
